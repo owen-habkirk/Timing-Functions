@@ -1,6 +1,10 @@
 #include <chrono>
 #include <thread>
 #include <stdexcept>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <cstdint>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #include <immintrin.h>
@@ -92,65 +96,152 @@ public:
 class stopwatch{
 private:
     using clock = std::chrono::steady_clock;
-    
-    std::chrono::nanoseconds duration{0};
-    
-    clock::time_point startTime;
+    using ns = std::chrono::nanoseconds;
+
+    ns duration{0};
+    clock::time_point startTime{};
     bool running = false;
+
+    mutable std::mutex mutex;
+    std::condition_variable wakeCondition;
+
+    std::mutex workerMutex;
+    std::thread worker;
+
+    std::atomic<std::uint64_t> generation{0};
+
+    void cancelScheduledOperation(){
+        generation.fetch_add(1, std::memory_order_acq_rel);
+        wakeCondition.notify_all();
+    }
+
+    template<typename Unit>
+    void scheduleAfter(Unit delay, bool resetTime){
+        if(delay < Unit::zero()){
+            throw std::invalid_argument("Duration cannot be negative");
+        }
+
+        std::lock_guard<std::mutex> workerLock(workerMutex);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            if(running){
+                return;
+            }
+
+            cancelScheduledOperation();
+        }
+
+        if(worker.joinable()){
+            worker.join();
+        }
+
+        const auto token = generation.load(std::memory_order_acquire);
+
+        worker = std::thread([this, delay, resetTime, token](){
+            const auto end = clock::now() + delay;
+
+            constexpr auto spinWindow = std::chrono::microseconds(200);
+
+            if(end - clock::now() > spinWindow){
+                std::unique_lock<std::mutex> lock(mutex);
+
+                wakeCondition.wait_until(lock, end - spinWindow, [this, token](){
+                    return generation.load(std::memory_order_acquire) != token;
+                });
+            }
+
+            while(clock::now() < end){
+                if(generation.load(std::memory_order_acquire) != token){
+                    return;
+                }
+
+                CPU_PAUSE();
+            }
+
+            std::lock_guard<std::mutex> lock(mutex);
+
+            if(generation.load(std::memory_order_acquire) != token || running){
+                return;
+            }
+
+            if(resetTime){
+                duration = ns{0};
+            }
+
+            startTime = clock::now();
+            running = true;
+        });
+    }
+
 public:
+    stopwatch() = default;
+
+    ~stopwatch(){
+        std::lock_guard<std::mutex> workerLock(workerMutex);
+
+        cancelScheduledOperation();
+
+        if(worker.joinable()){
+            worker.join();
+        }
+    }
+
+    stopwatch(const stopwatch&) = delete;
+    stopwatch& operator=(const stopwatch&) = delete;
+    stopwatch(stopwatch&&) = delete;
+    stopwatch& operator=(stopwatch&&) = delete;
+
     void start(){
+        std::lock_guard<std::mutex> lock(mutex);
+
+        cancelScheduledOperation();
+
         if(running){
             return;
         }
+
         startTime = clock::now();
         running = true;
     }
-    
-    template<typename unit>
-    unit getTime() const {
+
+    template<typename Unit>
+    Unit getTime() const {
+        std::lock_guard<std::mutex> lock(mutex);
+
         auto total = duration;
-        
-        if (running) {
-            total += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - startTime);
+
+        if(running){
+            total += std::chrono::duration_cast<ns>(clock::now() - startTime);
         }
-        
-        return std::chrono::duration_cast<unit>(total);
+
+        return std::chrono::duration_cast<Unit>(total);
     }
-    
+
     void pause(){
+        std::lock_guard<std::mutex> lock(mutex);
+
+        cancelScheduledOperation();
+
         if(running){
-            duration += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - startTime);
+            duration += std::chrono::duration_cast<ns>(clock::now() - startTime);
+
+            running = false;
         }
-        running = false;
     }
-    
+
     void resume(){
-        if(running){
-            return;
-        }
-        startTime = clock::now();
-        running = true;
+        start();
     }
-    
-    template<typename unit>
-    void resumeAfter(unit delay){
-        if(running){
-            return;
-        }
-        timer delayTimer(delay);
-        delayTimer.waitUntilDone();
-        startTime = clock::now();
-        running = true;
+
+    template<typename Unit>
+    void resumeAfter(Unit delay){
+        scheduleAfter(delay, false);
     }
-    
-    template<typename unit>
-    void startAfter(unit delay){
-        //If it is already running this wont do anything
-        if(running){return;}
-        timer<unit> delayTimer(delay);
-        delayTimer.waitUntilDone();
-        startTime = clock::now();
-        running = true;
+
+    template<typename Unit>
+    void startAfter(Unit delay){
+        scheduleAfter(delay, true);
     }
-    
 };
